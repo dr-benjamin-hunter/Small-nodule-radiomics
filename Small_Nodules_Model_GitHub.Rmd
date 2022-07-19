@@ -1,0 +1,250 @@
+---
+title: "LUCADI Study Small Nodule Analysis"
+author: "Dr. Benjamin Hunter (bhunter@ic.ac.uk)"
+date: "19/07/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(data.table)
+library(purrr)
+library(survival)
+library(ggplot2)
+library(caTools)
+library(glmnet)
+library(caret)
+library(e1071)
+library(xgboost)
+```
+
+
+1) Get the features and outcomes.x.RMP represents external test data from the Royal Marsden Partners screening study. 
+```{r GetFeatures}
+x.train <- read.csv('D:/Small_Nodules/Training_set_LUCADI.csv')
+x.test <- read.csv('D:/Small_Nodules/Test_set_LUCADI.csv')
+x.RMP <- read.csv('D:/Small_Nodules/External_test_set_LUCADI.csv')
+```
+
+2) Standardise the features
+```{r}
+#Take out clinical features
+train_mean <- colMeans(x.train[2:1999]) ## calulate the mean of the radiomics features, note not the clincial features
+train_std <- sapply(x.train[2:1999], sd, na.rm = TRUE) ## Standard deviataion
+
+scaled_train = scale(x.train[2:1999], center=train_mean, scale= train_std)
+scaled_test = scale(x.test[2:1999], center=train_mean, scale= train_std)
+scaled_RMP = scale(x.RMP[2:1999], center=train_mean, scale= train_std)
+
+
+scaled_train = as.data.frame(scaled_train)
+scaled_test = as.data.frame(scaled_test)
+scaled_RMP = as.data.frame(scaled_RMP)
+```
+
+3) Remove highly correlated features.
+```{r}
+tmp <- cor(scaled_train)
+tmp[upper.tri(tmp)] <- 0
+diag(tmp) <- 0
+
+scaled_train <- scaled_train[,!apply(tmp,2,function(x) any(x > 0.95))]
+scaled_test <- scaled_test[,!apply(tmp,2,function(x) any(x > 0.95))]
+scaled_RMP <- scaled_RMP[,!apply(tmp,2,function(x) any(x > 0.95))]
+
+head(scaled_train)
+ncol(scaled_train)
+```
+
+
+
+4) Add the outcome variables back into the scaled data.
+```{r}
+scaled_train$Outcome <- x.train$Outcome
+scaled_test$Outcome <- x.test$Outcome
+scaled_RMP$Outcome <- x.RMP$Outcome
+```
+
+5) Univariable logistic regression with BH correction to select highly significant features (p< 0.001).
+```{r}
+library(RegParallel)
+res <- RegParallel(
+  data = scaled_train,
+  formula = 'Outcome ~ [*]',
+  blocksize = 50,
+  FUN = function(formula, data)
+    glm(formula = formula,
+        data= data,
+        family = binomial(link = 'logit')),
+  FUNtype = 'glm',
+  variables = colnames(scaled_train)[1:ncol(scaled_train)-1])
+
+# res = tbl_uvregression(
+#   data = scaled_train,
+#   method = glm,
+#   y = Outcome
+# )
+
+        
+res_sig = res[,c(1,6)]
+res_sig$p_adjusted = p.adjust(res_sig$P, method = "BH", n = length(res_sig$P))
+
+final = subset(res_sig, p_adjusted < 0.001)
+uni_LR_variables <- final$Variable
+
+length(uni_LR_variables)
+uni_LR_variables
+```
+6) Subset the training and test sets to include only the significant subset of variables.
+```{r}
+scaled_train <- scaled_train[,uni_LR_variables]
+scaled_test <- scaled_test[,uni_LR_variables]
+scaled_RMP <- scaled_RMP[,uni_LR_variables]
+
+scaled_train$Outcome <- x.train$Outcome
+scaled_test$Outcome <- x.test$Outcome
+scaled_RMP$Outcome <- x.RMP$Outcome
+```
+
+7) Fit a LASSO model
+```{r}
+`%!in%` <- Negate(`%in%`)
+
+set.seed(1234)
+x = as.matrix(scaled_train[1:ncol(scaled_train)-1])
+y = as.matrix(scaled_train$Outcome)
+
+par(pty="s")
+fit <- glmnet(x, y, family="binomial",alpha=1, standardize=TRUE)
+plot(fit, label=)
+cv <- cv.glmnet(x, y, family="binomial",alpha=1,  standardize=TRUE)
+fit <- glmnet(x, y, family="binomial",alpha=1,lambda=cv$lambda.1se,  standardize=TRUE) 
+plot(cv)
+pred <- predict(fit, x)
+
+c<-coef(fit,s='lambda.1se')
+inds<-which(c!=0)
+variables<-row.names(c)[inds]
+LASSO.vars <-variables[variables %!in% '(Intercept)']
+print(length(LASSO.vars))
+LASSO.vars ## print the variables here...
+```
+8) Reduce the feature matrices to just those with non-zero co-efficients. Then multiply features by their LASSO weights and sum them to generate the LN-RPV
+
+```{r}
+x.train <- NULL
+x.train <- scaled_train[,LASSO.vars]
+
+x.test <- NULL
+x.test <- scaled_test[,LASSO.vars]
+
+x.RMP <- NULL
+x.RMP <- scaled_RMP[,LASSO.vars]
+```
+
+Show the selected features and their weights as a data frame. 
+```{r}
+c = as.data.frame(as.matrix(c))
+c = subset(c, s1 != 0)
+c = t(c)
+c = as.data.frame(c)
+c = c[-1]
+c
+```
+
+
+```{r}
+# c = as.vector(c) 
+
+for (i in 1:ncol(x.train)) {
+  for (r in 1:nrow(x.train)) {
+    x.train[r,i] = x.train[r,i]*as.numeric(c[1,i])
+  }
+}
+
+x.train$RPV <- rowSums(x.train)
+x.train$Outcome <- scaled_train$Outcome
+```
+
+```{r}
+for (i in 1:ncol(x.test)) {
+  for (r in 1:nrow(x.test)) {
+    x.test[r,i] = x.test[r,i]*as.numeric(c[1,i])
+  }
+}
+
+x.test$RPV <- rowSums(x.test)
+x.test$Outcome <- scaled_test$Outcome
+```
+
+```{r}
+for (i in 1:ncol(x.RMP)) {
+  for (r in 1:nrow(x.RMP)) {
+    x.RMP[r,i] = x.RMP[r,i]*as.numeric(c[1,i])
+  }
+}
+
+x.RMP$RPV <- rowSums(x.RMP)
+x.RMP$Outcome <- scaled_RMP$Outcome
+```
+
+
+9) Generate ROC curves and select optimal cut-point in the training subset to maximise Youden index. 
+```{r}
+library(cutpointr)
+train_roc = roc(x.train, RPV, Outcome, pos_class = 1, neg_class = 0, direction = ">=")
+plot(train_roc)
+
+train_cutoff = cutpointr(x.train, RPV, Outcome, pos_class = 1, neg_class = 0, direction = ">=", method = maximize_metric, metric = youden, boot_runs = 1000)
+train_cutoff
+
+boot_ci(train_cutoff, AUC, in_bag = TRUE, alpha = 0.05)
+```
+
+Generate prediction metrics using this cut-point. 
+```{r}
+train_pred <- ifelse(x.train$RPV >= -0.1887086, 1, 0)
+train_y = x.train$Outcome
+
+cm_train = confusionMatrix(factor(train_pred), factor(train_y), positive = '1')
+cm_train
+```
+```{r}
+test_pred <- ifelse(x.test$RPV >= -0.1887086, 1, 0)
+test_y = x.test$Outcome
+
+cm_test = confusionMatrix(factor(test_pred), factor(test_y), positive = '1')
+cm_test
+```
+```{r}
+ext_pred <- ifelse(x.RMP$RPV >= -0.1887086, 1, 0)
+ext_y = x.RMP$Outcome
+
+cm_ext = confusionMatrix(factor(ext_pred), factor(ext_y), positive = '1')
+cm_ext
+```
+Generate ROC curves and calculate AUCs for the test and external data. 
+
+```{r}
+library(cutpointr)
+test_roc = roc(x.test, RPV, Outcome, pos_class = 1, neg_class = 0, direction = ">=")
+plot(test_roc)
+
+test_cutoff = cutpointr(x.test, RPV, Outcome, pos_class = 1, neg_class = 0, direction = ">=", method = maximize_metric, metric = youden, boot_runs = 1000)
+test_cutoff
+
+boot_ci(test_cutoff, AUC, in_bag = TRUE, alpha = 0.05)
+```
+
+
+```{r}
+library(cutpointr)
+RMP_roc = roc(x.RMP, RPV, Outcome, pos_class = 1, neg_class = 0, direction = ">=")
+plot(RMP_roc)
+
+RMP_cutoff = cutpointr(x.RMP, RPV, Outcome, pos_class = 1, neg_class = 0, direction = ">=", method = maximize_metric, metric = youden, boot_runs = 1000)
+RMP_cutoff
+
+boot_ci(RMP_cutoff, AUC, in_bag = TRUE, alpha = 0.05)
+```
